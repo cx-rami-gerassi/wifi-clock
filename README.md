@@ -61,6 +61,7 @@ Short-press the BOOT button to cycle through:
 | **Big Date** | Weekday · big `DD/MM` · year |
 | **Seconds** | Large ticking seconds counter |
 | **Uptime** | Time since boot (`HH:MM:SS`, or `Nd HH:MM` past a day) |
+| **Weather** | Current temperature + conditions (Open-Meteo, refreshes every 15 min) |
 | **WiFi** | Connection status, SSID, IP, and signal (long-press here = setup) |
 | **Brightness** | Current level; long-press cycles Low / Med / High (saved across reboots) |
 | **Flashlight** | Long-press (~1s) lights the whole screen at full power; any press turns it off |
@@ -82,4 +83,4 @@ Short-press the BOOT button to cycle through:
 
 - ~~WiFi config portal~~ — done (browser-based setup, see above)
 - Auto-dimming / night brightness
-- Weather display
+- ~~Weather display~~ — done (Open-Meteo, no API key; set your coords via `WEATHER_LAT`/`WEATHER_LON`)

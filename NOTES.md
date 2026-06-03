@@ -59,6 +59,7 @@ Named stages you can jump back to (git tags). To return: `git checkout <tag>`, t
 | `v0.2-display-modes` | 2026-06-03 | Bigger clock font (logisoso20). BOOT button (GPIO9) cycles 4 screens: Clock → Big Date → Seconds → Uptime. Non-blocking loop for responsive button. |
 | `v0.3-wifi-setup`    | 2026-06-03 | Browser-based WiFi setup (SoftAP `WiFi-Clock` + captive page at 192.168.4.1, scanned list + manual SSID), creds in NVS, auto-reconnect, portal only on failure. Added WiFi status screen; long-press on it (only) re-opens setup non-destructively. Replaces `secrets.h`. |
 | `v0.4-bright-flash`  | 2026-06-03 | Manual brightness screen (Low/Med/High via `setContrast`, persisted in NVS, default max) + flashlight screen (full-white at max power). Long-press actions now fire on the hold-threshold, not on release, for immediate feedback. |
+| `v0.5-weather`       | 2026-06-03 | Weather screen: current temp + condition from Open-Meteo (HTTPS, no API key) for `WEATHER_LAT`/`WEATHER_LON` (default Tel Aviv). Non-blocking refresh (60s until first success, then every 15 min); WMO code → short label. |
 
 ## WiFi provisioning (how setup works)
 
@@ -86,5 +87,8 @@ Roughly in suggested order:
 2. **Auto-dimming / night brightness** — manual brightness + flashlight done in
    `v0.4-bright-flash`. Still open: switch brightness *automatically* by time of day (use the
    already-synced clock hour) or a photoresistor on an ADC pin.
-3. **Weather** — fetch current temp/conditions (e.g. Open-Meteo, no API key) over HTTPS and
-   show on a second screen or alternating with the clock.
+3. ~~**Weather**~~ — **done** (`v0.5-weather`). Open-Meteo over HTTPS (`WiFiClientSecure` +
+   `setInsecure()`), no API key. Gotcha: the response has a `current_units` object *before*
+   the real `current` data, so the JSON parse anchors to `indexOf("\"current\":")` first —
+   otherwise it reads `"temperature_2m":"°C"` from units and `atof` returns 0. Used the
+   `helvB14_tf` (not `_tr`) font for the `\xB0` degree glyph. Set coords via the two `#define`s.

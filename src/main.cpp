@@ -5,6 +5,8 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
 // ---------- CONFIG ----------
@@ -14,6 +16,11 @@
 
 // Name of the temporary network the clock creates for first-time WiFi setup.
 #define AP_SSID "WiFi-Clock"
+
+// Weather location (decimal degrees). Default: Tel Aviv. Open-Meteo is free and
+// needs no API key. Change these to your own coordinates.
+#define WEATHER_LAT "32.0853"
+#define WEATHER_LON "34.7818"
 // --------------------------------------------------
 
 #define SDA_PIN 5
@@ -29,8 +36,8 @@
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
 
 // Display screens, cycled by short-pressing the BOOT button.
-enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_WIFI,
-            MODE_BRIGHT, MODE_FLASH, MODE_COUNT };
+enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_WEATHER,
+            MODE_WIFI, MODE_BRIGHT, MODE_FLASH, MODE_COUNT };
 static Mode mode = MODE_CLOCK;
 
 // OLED brightness (contrast register). Three manual levels, persisted in NVS.
@@ -40,6 +47,12 @@ static Mode mode = MODE_CLOCK;
 static const uint8_t BRIGHT_VALUES[3] = {1, 40, 255};  // low / med / high
 static uint8_t brightLevel = 2;   // index into BRIGHT_VALUES; default = max
 static bool torchOn = false;      // flashlight: whole screen white at full power
+
+// Weather (Open-Meteo). Refreshed on a timer in loop(), shown on MODE_WEATHER.
+static float weatherTemp = 0;          // current temperature, deg C
+static int   weatherCode = -1;         // WMO weather code (-1 = unknown)
+static bool  weatherValid = false;     // true once a fetch has succeeded
+static unsigned long lastWeather = 0;  // millis() of last fetch (0 = never)
 
 // App phase: either serving the setup portal, or running the clock.
 enum AppState { ST_PORTAL, ST_RUN };
@@ -122,6 +135,68 @@ static void saveBrightness() {
   prefs.begin("cfg", false);
   prefs.putUChar("blvl", brightLevel);
   prefs.end();
+}
+
+// ---------- Weather (Open-Meteo, HTTPS, no API key) ----------
+
+// Pull the number that follows "key": in a JSON string. Tiny and allocation-free
+// -- enough for the flat Open-Meteo "current" object; not a general parser.
+static bool jsonNum(const String &json, const char *key, float &out) {
+  String pat = String("\"") + key + "\":";
+  int i = json.indexOf(pat);
+  if (i < 0) return false;
+  out = atof(json.c_str() + i + pat.length());
+  return true;
+}
+
+// WMO weather code -> short label that fits the 72px screen.
+static const char *wmoText(int code) {
+  if (code == 0) return "Clear";
+  if (code <= 3) return "Cloudy";
+  if (code <= 48) return "Fog";
+  if (code <= 57) return "Drizzle";
+  if (code <= 67) return "Rain";
+  if (code <= 77) return "Snow";
+  if (code <= 82) return "Showers";
+  if (code <= 86) return "Snow";
+  return "Storm";  // 95+
+}
+
+// Fetch current temperature + weather code over HTTPS. setInsecure() skips cert
+// validation -- fine for a public read-only endpoint on a hobby clock.
+static void fetchWeather() {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" WEATHER_LAT
+               "&longitude=" WEATHER_LON
+               "&current=temperature_2m,weather_code";
+  if (!http.begin(client, url)) {
+    Serial.println("Weather: http.begin failed");
+    return;
+  }
+  int rc = http.GET();
+  if (rc == 200) {
+    String body = http.getString();
+    // The response carries a "current_units" object (e.g. "temperature_2m":"°C")
+    // BEFORE the real "current" data, so anchor the parse to the data object --
+    // otherwise indexOf matches the units string and atof("°C") gives 0.
+    int ci = body.indexOf("\"current\":");
+    String cur = ci >= 0 ? body.substring(ci) : body;
+    float temp, code;
+    if (jsonNum(cur, "temperature_2m", temp) && jsonNum(cur, "weather_code", code)) {
+      weatherTemp = temp;
+      weatherCode = (int)code;
+      weatherValid = true;
+      Serial.printf("Weather: %.1fC code %d\n", weatherTemp, weatherCode);
+    } else {
+      Serial.println("Weather: parse failed");
+    }
+  } else {
+    Serial.printf("Weather: HTTP %d\n", rc);
+  }
+  http.end();
 }
 
 // ---------- Setup web portal ----------
@@ -376,6 +451,23 @@ static void drawUptime() {
   drawCentered(28, buf);
 }
 
+// MODE_WEATHER: current temperature (big) + condition text. "no data" until the
+// first successful fetch.
+static void drawWeather() {
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(8, "WEATHER");
+  if (!weatherValid) {
+    drawCentered(26, "no data");
+    return;
+  }
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d\xB0""C", (int)lround(weatherTemp));
+  u8g2.setFont(u8g2_font_helvB14_tf);  // _tf: includes the degree glyph 0xB0
+  drawCentered(28, buf);
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(39, wmoText(weatherCode));
+}
+
 // MODE_WIFI: connection status, network name, IP, and signal strength.
 static void drawWifi() {
   u8g2.setFont(u8g2_font_5x8_tr);
@@ -497,6 +589,19 @@ void loop() {
     }
   }
 
+  unsigned long now = millis();
+
+  // ---- Weather refresh (non-blocking cadence) ----
+  // Retry every 60s until the first success, then every 15 min. The blocking
+  // HTTPS GET runs at most once per interval, so the loop stays responsive.
+  if (WiFi.status() == WL_CONNECTED) {
+    unsigned long due = weatherValid ? 900000UL : 60000UL;
+    if (lastWeather == 0 || now - lastWeather >= due) {
+      lastWeather = now;
+      fetchWeather();
+    }
+  }
+
   pollButton();  // short press cycles modes; long press opens setup
   if (appState == ST_PORTAL) return;  // long-press just switched us to setup
 
@@ -509,7 +614,6 @@ void loop() {
   // Redraw at ~4Hz (smooth colon blink / ticking seconds) but keep the loop
   // itself fast so the button stays responsive.
   static unsigned long lastDraw = 0;
-  unsigned long now = millis();
   if (now - lastDraw >= 250) {
     lastDraw = now;
     u8g2.clearBuffer();
@@ -518,6 +622,7 @@ void loop() {
       case MODE_DATE:    drawBigDate(t); break;
       case MODE_SECONDS: drawSeconds(t); break;
       case MODE_UPTIME:  drawUptime();   break;
+      case MODE_WEATHER: drawWeather();  break;
       case MODE_WIFI:    drawWifi();     break;
       case MODE_BRIGHT:  drawBright();   break;
       case MODE_FLASH:   drawFlash();    break;
