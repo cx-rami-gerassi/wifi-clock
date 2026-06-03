@@ -62,6 +62,8 @@ Short-press the BOOT button to cycle through:
 | **Seconds** | Large ticking seconds counter |
 | **Uptime** | Time since boot (`HH:MM:SS`, or `Nd HH:MM` past a day) |
 | **WiFi** | Connection status, SSID, IP, and signal (long-press here = setup) |
+| **Brightness** | Current level; long-press cycles Low / Med / High (saved across reboots) |
+| **Flashlight** | Long-press (~1s) lights the whole screen at full power; any press turns it off |
 
 ## Design notes
 

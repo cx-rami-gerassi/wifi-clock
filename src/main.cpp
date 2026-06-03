@@ -29,8 +29,17 @@
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
 
 // Display screens, cycled by short-pressing the BOOT button.
-enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_WIFI, MODE_COUNT };
+enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_WIFI,
+            MODE_BRIGHT, MODE_FLASH, MODE_COUNT };
 static Mode mode = MODE_CLOCK;
+
+// OLED brightness (contrast register). Three manual levels, persisted in NVS.
+// This panel's contrast curve is lopsided -- it bunches up at the low end AND
+// saturates near the top (anything past ~128 looks the same as 255), so the
+// only well-separated triple is very-low / ~40 / max.
+static const uint8_t BRIGHT_VALUES[3] = {1, 40, 255};  // low / med / high
+static uint8_t brightLevel = 2;   // index into BRIGHT_VALUES; default = max
+static bool torchOn = false;      // flashlight: whole screen white at full power
 
 // App phase: either serving the setup portal, or running the clock.
 enum AppState { ST_PORTAL, ST_RUN };
@@ -91,6 +100,27 @@ static void saveCreds(const String &ssid, const String &pass) {
   prefs.begin("wifi", false);
   prefs.putString("ssid", ssid);
   prefs.putString("pass", pass);
+  prefs.end();
+}
+
+// ---------- Brightness (NVS namespace "cfg") ----------
+
+static void applyBrightness() {
+  u8g2.setContrast(BRIGHT_VALUES[brightLevel]);
+}
+
+static void loadBrightness() {
+  // Key is "blvl" (renamed from "bright") so any value saved during earlier
+  // testing is ignored once -- the device starts at max by default.
+  prefs.begin("cfg", true);
+  brightLevel = prefs.getUChar("blvl", 2);  // default: max
+  prefs.end();
+  if (brightLevel > 2) brightLevel = 2;
+}
+
+static void saveBrightness() {
+  prefs.begin("cfg", false);
+  prefs.putUChar("blvl", brightLevel);
   prefs.end();
 }
 
@@ -211,14 +241,21 @@ static bool tryConnect(uint32_t timeoutMs) {
 
 // ---------- Button ----------
 
-// Debounced edge-detect on the BOOT button. Short press -> next screen.
-// Long press (>=LONG_PRESS_MS) opens the setup portal, but ONLY from the WiFi
-// screen, so it's deliberate -- and it leaves the saved network untouched, so
-// backing out (power-cycle) still reconnects to it. A long press on any other
-// screen is ignored.
+// Debounced BOOT button.
+//   Short press            -> next screen (fires on release; needed to tell a
+//                             short press apart from the start of a long one).
+//   Long press (>=1.5s)    -> the action for the current screen, fired THE
+//                             INSTANT the hold crosses the threshold (while
+//                             still pressed) so it feels immediate:
+//       WiFi   -> open the setup portal (saved creds left untouched)
+//       Bright -> step Low/Med/High (persisted)
+//       Flash  -> turn the flashlight on (whole screen, full power)
+//       others -> ignored
+//   While the flashlight is on, the next press turns it off immediately.
 static void pollButton() {
   static bool stable = HIGH, lastReading = HIGH;
   static unsigned long lastChange = 0, pressStart = 0;
+  static bool handled = false;  // long-press / torch-off already acted on
 
   bool reading = digitalRead(BTN_PIN);
   unsigned long now = millis();
@@ -226,17 +263,41 @@ static void pollButton() {
     lastReading = reading;
     lastChange = now;
   }
-  if (now - lastChange > 25 && reading != stable) {
+
+  if (now - lastChange > 25 && reading != stable) {  // debounced edge
     stable = reading;
-    if (stable == LOW) {           // pressed
+    if (stable == LOW) {           // just pressed
       pressStart = now;
-    } else {                       // released
-      if (now - pressStart >= LONG_PRESS_MS) {
-        if (mode == MODE_WIFI) startPortal();  // setup only from WiFi screen;
-                                               // saved creds left untouched
-      } else {
-        mode = (Mode)((mode + 1) % MODE_COUNT);
+      handled = false;
+      if (torchOn) {               // any press exits flashlight, right away
+        torchOn = false;
+        applyBrightness();         // restore the chosen level
+        handled = true;            // consume: ignore this press's release
       }
+    } else {                       // just released
+      if (!handled) mode = (Mode)((mode + 1) % MODE_COUNT);  // short press
+    }
+  }
+
+  // Fire the long-press action the moment the hold passes the threshold,
+  // without waiting for release.
+  if (stable == LOW && !handled && now - pressStart >= LONG_PRESS_MS) {
+    handled = true;
+    switch (mode) {
+      case MODE_WIFI:
+        startPortal();             // setup only from WiFi screen
+        break;
+      case MODE_BRIGHT:
+        brightLevel = (brightLevel + 1) % 3;
+        applyBrightness();
+        saveBrightness();
+        break;
+      case MODE_FLASH:
+        torchOn = true;
+        u8g2.setContrast(255);     // full power while the torch is on
+        break;
+      default:
+        break;                     // long press ignored elsewhere
     }
   }
 }
@@ -334,6 +395,29 @@ static void drawWifi() {
   }
 }
 
+// MODE_BRIGHT: current brightness level; long-press cycles Low/Med/High.
+static void drawBright() {
+  const char *name = brightLevel == 0 ? "LOW" : brightLevel == 1 ? "MED" : "HIGH";
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(8, "BRIGHTNESS");
+  u8g2.setFont(u8g2_font_helvB14_tr);
+  drawCentered(28, name);
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(39, "hold=change");
+}
+
+// MODE_FLASH: a flashlight. When on, fill the panel; otherwise show the hint.
+static void drawFlash() {
+  if (torchOn) {
+    u8g2.drawBox(0, 0, 72, 40);  // whole screen lit
+    return;
+  }
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(8, "FLASHLIGHT");
+  drawCentered(22, "hold 1s");
+  drawCentered(34, "to turn on");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1500);  // let USB CDC enumerate before logging
@@ -342,6 +426,8 @@ void setup() {
   // u8g2.begin() again after the radio is up wedges the C3 (see NOTES.md).
   u8g2.begin();
   u8g2.setBusClock(100000);  // 100kHz I2C: more tolerant of supply noise
+  loadBrightness();
+  applyBrightness();         // honor the saved brightness from the first frame
 
   loadCreds();
 
@@ -433,6 +519,8 @@ void loop() {
       case MODE_SECONDS: drawSeconds(t); break;
       case MODE_UPTIME:  drawUptime();   break;
       case MODE_WIFI:    drawWifi();     break;
+      case MODE_BRIGHT:  drawBright();   break;
+      case MODE_FLASH:   drawFlash();    break;
       default:           drawClock(t);   break;
     }
     u8g2.sendBuffer();

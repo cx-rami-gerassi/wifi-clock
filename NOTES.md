@@ -27,6 +27,13 @@ The trade-off is a weaker link (~-67 dBm on the test network), which makes dropp
 more likely — hence the self-healing sync above. Don't "fix" the low TX power without
 re-checking the brownout behavior.
 
+### The OLED's brightness (contrast) curve is lopsided
+`u8g2.setContrast()` (SSD1306 cmd 0x81) is the only brightness knob, but on this panel it's
+badly non-linear: low values bunch together (`12` and `90` look identical) AND it saturates
+near the top (`128` looks the same as `255`). The only visibly-distinct triple we found is
+`{1, 40, 255}` (low/med/high). If you change these, eyeball them on real hardware — evenly
+spaced numbers do NOT give evenly spaced brightness.
+
 ## Hardware
 
 - ESP32-C3 (`esp32-c3-devkitm-1`)
@@ -51,6 +58,7 @@ Named stages you can jump back to (git tags). To return: `git checkout <tag>`, t
 | `v0.1-working-clock` | 2026-06-03 | Baseline working clock: WiFi connect, non-blocking self-healing NTP sync, HH:MM + blinking colon, date & seconds on OLED. Pre-roadmap. |
 | `v0.2-display-modes` | 2026-06-03 | Bigger clock font (logisoso20). BOOT button (GPIO9) cycles 4 screens: Clock → Big Date → Seconds → Uptime. Non-blocking loop for responsive button. |
 | `v0.3-wifi-setup`    | 2026-06-03 | Browser-based WiFi setup (SoftAP `WiFi-Clock` + captive page at 192.168.4.1, scanned list + manual SSID), creds in NVS, auto-reconnect, portal only on failure. Added WiFi status screen; long-press on it (only) re-opens setup non-destructively. Replaces `secrets.h`. |
+| `v0.4-bright-flash`  | 2026-06-03 | Manual brightness screen (Low/Med/High via `setContrast`, persisted in NVS, default max) + flashlight screen (full-white at max power). Long-press actions now fire on the hold-threshold, not on release, for immediate feedback. |
 
 ## WiFi provisioning (how setup works)
 
@@ -75,7 +83,8 @@ Roughly in suggested order:
 
 1. ~~**WiFi config portal**~~ — **done** (`v0.3-wifi-setup`). Browser setup over a SoftAP,
    creds persisted in NVS; `secrets.h` removed. See "WiFi provisioning" above.
-2. **Auto-dimming / night brightness** — adjust OLED contrast by time of day (or a
-   photoresistor) via `u8g2.setContrast()`.
+2. **Auto-dimming / night brightness** — manual brightness + flashlight done in
+   `v0.4-bright-flash`. Still open: switch brightness *automatically* by time of day (use the
+   already-synced clock hour) or a photoresistor on an ADC pin.
 3. **Weather** — fetch current temp/conditions (e.g. Open-Meteo, no API key) over HTTPS and
    show on a second screen or alternating with the clock.
