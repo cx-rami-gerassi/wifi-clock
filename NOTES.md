@@ -42,6 +42,7 @@ Named stages you can jump back to (git tags). To return: `git checkout <tag>`, t
 | Tag                  | Date       | Functionality                                                                 |
 | -------------------- | ---------- | ----------------------------------------------------------------------------- |
 | `v0.1-working-clock` | 2026-06-03 | Baseline working clock: WiFi connect, non-blocking self-healing NTP sync, HH:MM + blinking colon, date & seconds on OLED. Pre-roadmap. |
+| `v0.2-display-modes` | 2026-06-03 | Bigger clock font (logisoso20). BOOT button (GPIO9) cycles 4 screens: Clock → Big Date → Seconds → Uptime. Non-blocking loop for responsive button. |
 
 ## Roadmap
 
