@@ -1,0 +1,8 @@
+# PlatformIO build output
+.pio/
+
+# Local secrets — never commit real WiFi credentials
+include/secrets.h
+
+# macOS
+.DS_Store
