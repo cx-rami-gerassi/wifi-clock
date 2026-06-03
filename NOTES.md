@@ -34,6 +34,15 @@ re-checking the brownout behavior.
 - On macOS the board enumerates as native USB-CDC (e.g. `/dev/cu.usbmodem101`). Opening the
   serial port does **not** reset the chip; pulse DTR/RTS to reset.
 
+## Milestones
+
+Named stages you can jump back to (git tags). To return: `git checkout <tag>`, then
+`git switch -` to come back. List them with `git tag -n`.
+
+| Tag                  | Date       | Functionality                                                                 |
+| -------------------- | ---------- | ----------------------------------------------------------------------------- |
+| `v0.1-working-clock` | 2026-06-03 | Baseline working clock: WiFi connect, non-blocking self-healing NTP sync, HH:MM + blinking colon, date & seconds on OLED. Pre-roadmap. |
+
 ## Roadmap
 
 Roughly in suggested order:
