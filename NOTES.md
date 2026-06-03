@@ -31,8 +31,15 @@ re-checking the brownout behavior.
 
 - ESP32-C3 (`esp32-c3-devkitm-1`)
 - SSD1306 72×40 I²C OLED: `SDA` → GPIO 5, `SCL` → GPIO 6
+- **Buttons:** `BOOT` = GPIO 9 — readable in firmware (active-low, `INPUT_PULLUP`); a short
+  press cycles display modes. `RST` = hardware reset, *not* readable. Which one is physically
+  left vs right depends on board orientation, so **go by the silkscreen label**, not the side.
+- **2.4 GHz only:** the C3 radio cannot see 5 GHz networks. A 5 GHz-only SSID just hangs
+  forever on "WiFi connecting" (the connect loop blocks with no timeout). Use the 2.4 GHz band.
 - On macOS the board enumerates as native USB-CDC (e.g. `/dev/cu.usbmodem101`). Opening the
-  serial port does **not** reset the chip; pulse DTR/RTS to reset.
+  serial port does **not** reset the chip; pulse DTR/RTS to reset. Note: passively reading the
+  port often misses the boot/connect log because the ROM and app hand off the USB endpoint —
+  the reliable way to capture boot output is to attach the monitor right after a flash.
 
 ## Milestones
 
