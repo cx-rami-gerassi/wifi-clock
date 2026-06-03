@@ -126,13 +126,13 @@ void loop() {
 
   // Big time. Draw HH, colon, and MM at FIXED positions so the digits never
   // shift; the colon just blinks on/off once per second.
-  u8g2.setFont(u8g2_font_logisoso16_tn);
+  u8g2.setFont(u8g2_font_logisoso20_tn);
   int wHH = u8g2.getStrWidth(hhStr);
   int wColon = u8g2.getStrWidth(":");
   int total = wHH + wColon + u8g2.getStrWidth(mmStr);
   int x = (72 - total) / 2;
   if (x < 0) x = 0;
-  const int yTime = 22;
+  const int yTime = 23;
   u8g2.drawStr(x, yTime, hhStr);
   if (t.tm_sec % 2) u8g2.drawStr(x + wHH, yTime, ":");
   u8g2.drawStr(x + wHH + wColon, yTime, mmStr);
