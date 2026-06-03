@@ -36,6 +36,9 @@ pio device monitor            # serial logs @ 115200
 
 ## Design notes
 
+> For deeper context, hard-won gotchas, and the full roadmap, see [NOTES.md](NOTES.md).
+
+
 - **Sync never freezes.** NTP runs non-blocking in `loop()`, showing a live counter and
   re-requesting every 8 s, so a dropped first packet self-heals instead of hanging on the
   "Syncing time..." screen.
