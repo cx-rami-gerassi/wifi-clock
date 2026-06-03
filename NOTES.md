@@ -50,14 +50,31 @@ Named stages you can jump back to (git tags). To return: `git checkout <tag>`, t
 | -------------------- | ---------- | ----------------------------------------------------------------------------- |
 | `v0.1-working-clock` | 2026-06-03 | Baseline working clock: WiFi connect, non-blocking self-healing NTP sync, HH:MM + blinking colon, date & seconds on OLED. Pre-roadmap. |
 | `v0.2-display-modes` | 2026-06-03 | Bigger clock font (logisoso20). BOOT button (GPIO9) cycles 4 screens: Clock → Big Date → Seconds → Uptime. Non-blocking loop for responsive button. |
+| `v0.3-wifi-setup`    | 2026-06-03 | Browser-based WiFi setup (SoftAP `WiFi-Clock` + captive page at 192.168.4.1, scanned list + manual SSID), creds in NVS, auto-reconnect, portal only on failure. Added WiFi status screen; long-press on it (only) re-opens setup non-destructively. Replaces `secrets.h`. |
+
+## WiFi provisioning (how setup works)
+
+`secrets.h` is gone — credentials live in NVS (Preferences namespace `wifi`) and are
+entered over a web page, not compiled in.
+
+- **Boot:** load creds → if present, try to connect for 20 s → on success run the clock,
+  on failure (or no creds) fall into the setup portal. So the last-known-good network is
+  always tried first; the portal only appears when it can't connect.
+- **Portal:** `WIFI_AP_STA` mode so `WiFi.scanNetworks()` works while the AP is up; a
+  `WebServer` serves the form and `DNSServer` does the captive redirect. Saving creds calls
+  `ESP.restart()` — the cleanest AP→STA transition (no teardown juggling).
+- **Re-entering setup:** long-press BOOT **only from the WiFi screen** (deliberate, avoids
+  accidental triggers). It calls `startPortal()` live without erasing NVS, so a power-cycle
+  reconnects to the saved network if you don't submit anything new.
+- Don't try to force the portal by holding BOOT during reset — GPIO9 held at reset enters
+  firmware-download mode, not the app.
 
 ## Roadmap
 
 Roughly in suggested order:
 
-1. **WiFi config portal** — stop hardcoding credentials. On first boot (or failed connect),
-   start a SoftAP + captive web page to enter SSID/password; persist in NVS/Preferences.
-   Biggest usability win and removes the need for `secrets.h`.
+1. ~~**WiFi config portal**~~ — **done** (`v0.3-wifi-setup`). Browser setup over a SoftAP,
+   creds persisted in NVS; `secrets.h` removed. See "WiFi provisioning" above.
 2. **Auto-dimming / night brightness** — adjust OLED contrast by time of day (or a
    photoresistor) via `u8g2.setContrast()`.
 3. **Weather** — fetch current temp/conditions (e.g. Open-Meteo, no API key) over HTTPS and
