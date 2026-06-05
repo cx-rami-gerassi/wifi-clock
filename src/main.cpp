@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -36,8 +37,9 @@
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
 
 // Display screens, cycled by short-pressing the BOOT button.
-enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_WEATHER,
-            MODE_WIFI, MODE_BRIGHT, MODE_FLASH, MODE_COUNT };
+enum Mode { MODE_CLOCK, MODE_DATE, MODE_SECONDS, MODE_UPTIME, MODE_STATS,
+            MODE_WEATHER, MODE_WIFI, MODE_BRIGHT, MODE_FLASH, MODE_EMERGENCY,
+            MODE_RUNNER, MODE_COUNT };
 static Mode mode = MODE_CLOCK;
 
 // OLED brightness (contrast register). Three manual levels, persisted in NVS.
@@ -46,7 +48,14 @@ static Mode mode = MODE_CLOCK;
 // only well-separated triple is very-low / ~40 / max.
 static const uint8_t BRIGHT_VALUES[3] = {1, 40, 255};  // low / med / high
 static uint8_t brightLevel = 2;   // index into BRIGHT_VALUES; default = max
-static bool torchOn = false;      // flashlight: whole screen white at full power
+static bool torchOn = false;      // flashlight: whole screen steady white
+static bool strobeOn = false;     // emergency light: whole screen flashing white
+static uint8_t flashHz = 2;       // strobe rate, flashes/sec (1..10), web-adjustable
+static unsigned long jumpStart = 0;  // RUNNER: millis() a jump began (0 = grounded)
+
+// torchOn and strobeOn are full-screen overrides: when either is set the panel
+// is taken over (steady or flashing) regardless of which screen `mode` selects.
+// They are mutually exclusive.
 
 // Weather (Open-Meteo). Refreshed on a timer in loop(), shown on MODE_WEATHER.
 static float weatherTemp = 0;          // current temperature, deg C
@@ -62,6 +71,10 @@ Preferences prefs;          // persists WiFi creds in NVS (namespace "wifi")
 WebServer server(80);       // setup web page
 DNSServer dns;              // captive-portal redirect during setup
 String wifiSsid, wifiPass;  // current credentials (loaded from NVS)
+
+// Registers all HTTP routes exactly once. Both the setup portal and the run-mode
+// dashboard share the same WebServer + routes; handlers branch on appState.
+static void registerRoutes();
 
 // ---------- Small drawing helpers ----------
 
@@ -134,6 +147,22 @@ static void loadBrightness() {
 static void saveBrightness() {
   prefs.begin("cfg", false);
   prefs.putUChar("blvl", brightLevel);
+  prefs.end();
+}
+
+// ---------- Emergency-strobe frequency (NVS namespace "cfg") ----------
+
+static void loadFlashFreq() {
+  prefs.begin("cfg", true);
+  flashHz = prefs.getUChar("freq", 2);  // default 2 Hz
+  prefs.end();
+  if (flashHz < 1) flashHz = 1;
+  if (flashHz > 10) flashHz = 10;
+}
+
+static void saveFlashFreq() {
+  prefs.begin("cfg", false);
+  prefs.putUChar("freq", flashHz);
   prefs.end();
 }
 
@@ -267,9 +296,11 @@ static void handleSave() {
   ESP.restart();
 }
 
-// Captive-portal: send any other request back to the setup page.
+// Unknown path: in setup, bounce to the captive portal; in run mode, to the
+// dashboard root.
 static void handleNotFound() {
-  server.sendHeader("Location", "http://192.168.4.1/");
+  server.sendHeader("Location",
+                    appState == ST_PORTAL ? "http://192.168.4.1/" : "/");
   server.send(302, "text/plain", "");
 }
 
@@ -282,14 +313,189 @@ static void startPortal() {
   IPAddress ip = WiFi.softAPIP();  // 192.168.4.1
   dns.start(53, "*", ip);
 
-  server.on("/", handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.onNotFound(handleNotFound);
+  registerRoutes();
   server.begin();
 
   showPortalScreen();
   Serial.printf("Setup portal up: join '%s', open http://%s/\n",
                 AP_SSID, ip.toString().c_str());
+}
+
+// ---------- Run-mode web dashboard ----------
+// Unlike the setup portal, this runs while the clock is running, on the home
+// network. It's a single self-contained page (no external assets) that polls a
+// JSON endpoint and POSTs control changes back, so it works offline on the LAN.
+
+// The dashboard page. Served verbatim; all live data comes from /api, all
+// actions go to /set, so the HTML itself is static.
+static const char DASH_HTML[] = R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WiFi Clock</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#0b0f14;color:#e6edf3}
+.wrap{max-width:460px;margin:0 auto;padding:18px}
+h1{font-size:1.05rem;margin:.2em 0 0;letter-spacing:.04em;color:#9aa7b2}
+.time{font-size:2.7rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1;margin:.05em 0}
+.sub{color:#9aa7b2;font-size:.9rem;margin-bottom:.4em}
+.card{background:#151c25;border:1px solid #222c38;border-radius:12px;padding:14px;margin:12px 0}
+.card h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:#7f93a6;margin:0 0 .7em}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.modes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+button{font:inherit;padding:.7em .4em;border-radius:9px;border:1px solid #2b3a4a;background:#1c2733;color:#e6edf3;cursor:pointer}
+button:active{transform:scale(.97)}
+button.on{background:#2563eb;border-color:#2563eb;color:#fff}
+.row{display:flex;justify-content:space-between;padding:.25em 0;font-size:.95rem}
+.row span:last-child{color:#9aa7b2}
+input[type=range]{width:100%;margin:.5em 0 0;accent-color:#2563eb}
+.btn{width:100%}
+</style></head><body><div class=wrap>
+<h1>WIFI CLOCK</h1>
+<div class=time id=time>--:--:--</div>
+<div class=sub id=date>&nbsp;</div>
+<div class=card><h2>Display</h2><div class=modes id=modes></div></div>
+<div class=card><h2>Brightness</h2><div class=modes>
+<button onclick="set('bright=0')">Low</button>
+<button onclick="set('bright=1')">Med</button>
+<button onclick="set('bright=2')">High</button>
+</div></div>
+<div class=card><h2>Flashlight</h2>
+<button id=torch class=btn onclick="set('torch='+(T?0:1))">Light On / Off</button>
+</div>
+<div class=card><h2>Emergency Light</h2>
+<button id=strobe class=btn onclick="set('strobe='+(S?0:1))">Flash On / Off</button>
+<div class=row style="margin-top:.7em"><span>Frequency</span><span id=hz>- Hz</span></div>
+<input type=range min=1 max=10 step=1 id=freq oninput="hz.textContent=this.value+' Hz'" onchange="set('freq='+this.value)">
+</div>
+<div class=card><h2>Status</h2>
+<div class=row><span>Weather</span><span id=wx>-</span></div>
+<div class=row><span>Network</span><span id=net>-</span></div>
+<div class=row><span>IP</span><span id=ip>-</span></div>
+<div class=row><span>Uptime</span><span id=up>-</span></div>
+<div class=row><span>Free heap</span><span id=heap>-</span></div>
+</div></div><script>
+const N=["Clock","Date","Seconds","Uptime","Stats","Weather","WiFi","Bright","Flash","Emergency","Runner"];
+let cur=-1,T=false,S=false;
+const mc=document.getElementById('modes');
+N.forEach((n,i)=>{let b=document.createElement('button');b.textContent=n;b.dataset.i=i;b.onclick=()=>set('mode='+i);mc.appendChild(b);});
+function set(q){fetch('/set?'+q).then(load);}
+function up(s){let d=Math.floor(s/86400);s%=86400;let h=Math.floor(s/3600);s%=3600;let m=Math.floor(s/60);return (d?d+'d ':'')+[h,m,s%60].map(x=>String(x).padStart(2,'0')).join(':');}
+function load(){fetch('/api').then(r=>r.json()).then(d=>{
+ time.textContent=d.time;date.innerHTML=d.date||'&nbsp;';
+ wx.textContent=d.wxValid?Math.round(d.wxTemp)+'°C '+d.wxCond:'no data';
+ net.textContent=d.ssid+' ('+d.rssi+' dBm)';ip.textContent=d.ip;
+ up_.textContent=up(d.uptime);heap.textContent=(d.heap/1024).toFixed(1)+' KB';
+ T=!!d.torch;torch.classList.toggle('on',T);
+ S=!!d.strobe;strobe.classList.toggle('on',S);
+ if(document.activeElement!==freq)freq.value=d.freq;
+ hz.textContent=freq.value+' Hz';
+ if(d.mode!=cur){cur=d.mode;[...mc.children].forEach(b=>b.classList.toggle('on',+b.dataset.i===cur));}
+}).catch(()=>{});}
+const up_=document.getElementById('up');
+load();setInterval(load,1000);
+</script></body></html>)HTML";
+
+static void handleDash() {
+  server.send(200, "text/html", DASH_HTML);
+}
+
+// "/" serves the setup page during setup, the dashboard while running.
+static void handleRootDispatch() {
+  if (appState == ST_PORTAL) handleRoot();
+  else handleDash();
+}
+
+// Live status as JSON for the dashboard to poll.
+static void handleApi() {
+  struct tm t;
+  char timeStr[9] = "--:--:--", dateStr[20] = "";
+  if (getLocalTime(&t, 10)) {
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &t);
+    strftime(dateStr, sizeof(dateStr), "%a %d/%m/%Y", &t);
+  }
+  String j = "{";
+  j += "\"time\":\"" + String(timeStr) + "\",";
+  j += "\"date\":\"" + String(dateStr) + "\",";
+  j += "\"uptime\":" + String(millis() / 1000) + ",";
+  j += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  j += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  j += "\"ssid\":\"" + esc(WiFi.SSID()) + "\",";
+  j += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  j += "\"mode\":" + String((int)mode) + ",";
+  j += "\"bright\":" + String(brightLevel) + ",";
+  j += "\"torch\":" + String(torchOn ? 1 : 0) + ",";
+  j += "\"strobe\":" + String(strobeOn ? 1 : 0) + ",";
+  j += "\"freq\":" + String(flashHz) + ",";
+  j += "\"wxValid\":" + String(weatherValid ? 1 : 0) + ",";
+  j += "\"wxTemp\":" + String(weatherTemp, 1) + ",";
+  j += "\"wxCond\":\"" + String(weatherValid ? wmoText(weatherCode) : "") + "\"";
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+// Apply a control change. Each knob is an optional query arg, so the dashboard
+// can set one thing at a time. Mirrors the button-handler semantics exactly.
+static void handleSet() {
+  if (server.hasArg("mode")) {
+    int m = server.arg("mode").toInt();
+    if (m >= 0 && m < MODE_COUNT) {
+      mode = (Mode)m;
+      if (torchOn || strobeOn) {     // changing screens turns the light off
+        torchOn = strobeOn = false;
+        applyBrightness();
+      }
+    }
+  }
+  if (server.hasArg("bright")) {
+    int b = server.arg("bright").toInt();
+    if (b >= 0 && b <= 2) {
+      brightLevel = (uint8_t)b;
+      if (!torchOn && !strobeOn) applyBrightness();
+      saveBrightness();
+    }
+  }
+  if (server.hasArg("torch")) {
+    if (server.arg("torch").toInt()) { torchOn = true; strobeOn = false; u8g2.setContrast(255); }
+    else { torchOn = false; applyBrightness(); }
+  }
+  if (server.hasArg("strobe")) {
+    if (server.arg("strobe").toInt()) { strobeOn = true; torchOn = false; u8g2.setContrast(255); }
+    else { strobeOn = false; applyBrightness(); }
+  }
+  if (server.hasArg("freq")) {
+    int f = server.arg("freq").toInt();
+    if (f < 1) f = 1;
+    if (f > 10) f = 10;
+    flashHz = (uint8_t)f;
+    saveFlashFreq();
+  }
+  if (server.hasArg("jump") && mode == MODE_RUNNER) jumpStart = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+// Registers every route once (idempotent). "/" and onNotFound branch on
+// appState so the portal and the dashboard can share one WebServer.
+static void registerRoutes() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  server.on("/", handleRootDispatch);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/api", handleApi);
+  server.on("/set", handleSet);
+  server.onNotFound(handleNotFound);
+}
+
+static void startDashboard() {
+  registerRoutes();
+  server.begin();
+
+  // mDNS: reach the clock at http://wifi-clock.local/ without knowing the IP.
+  if (MDNS.begin("wifi-clock")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS up: http://wifi-clock.local/");
+  }
+  Serial.printf("Dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
 }
 
 // Try to join the saved network within timeoutMs. Shows progress on the OLED.
@@ -324,9 +530,11 @@ static bool tryConnect(uint32_t timeoutMs) {
 //                             still pressed) so it feels immediate:
 //       WiFi   -> open the setup portal (saved creds left untouched)
 //       Bright -> step Low/Med/High (persisted)
-//       Flash  -> turn the flashlight on (whole screen, full power)
+//       Flash  -> turn the steady flashlight on (whole screen, full power)
+//       Emerg  -> turn the emergency strobe on (whole screen flashing)
+//       Runner -> make the figure jump
 //       others -> ignored
-//   While the flashlight is on, the next press turns it off immediately.
+//   While either light (steady or strobe) is on, the next press turns it off.
 static void pollButton() {
   static bool stable = HIGH, lastReading = HIGH;
   static unsigned long lastChange = 0, pressStart = 0;
@@ -344,8 +552,9 @@ static void pollButton() {
     if (stable == LOW) {           // just pressed
       pressStart = now;
       handled = false;
-      if (torchOn) {               // any press exits flashlight, right away
+      if (torchOn || strobeOn) {   // any press exits the light, right away
         torchOn = false;
+        strobeOn = false;
         applyBrightness();         // restore the chosen level
         handled = true;            // consume: ignore this press's release
       }
@@ -369,7 +578,16 @@ static void pollButton() {
         break;
       case MODE_FLASH:
         torchOn = true;
+        strobeOn = false;
         u8g2.setContrast(255);     // full power while the torch is on
+        break;
+      case MODE_EMERGENCY:
+        strobeOn = true;
+        torchOn = false;
+        u8g2.setContrast(255);     // full power for the strobe too
+        break;
+      case MODE_RUNNER:
+        jumpStart = millis();      // launch a jump (ignored if already airborne)
         break;
       default:
         break;                     // long press ignored elsewhere
@@ -451,6 +669,23 @@ static void drawUptime() {
   drawCentered(28, buf);
 }
 
+// MODE_STATS: the board's closest thing to `top`. There's no shell on the
+// ESP32-C3 (it runs FreeRTOS, not a general-purpose OS), so we print the live
+// numbers ourselves: free heap now, the lowest the heap has ever dropped to
+// (a leak shows up here), and the CPU clock.
+static void drawStats() {
+  char buf[16];
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(8, "MEMORY");
+  // KB with one decimal so small drifts are visible on a ~270 KB heap.
+  snprintf(buf, sizeof(buf), "free %4.1fk", ESP.getFreeHeap() / 1024.0);
+  u8g2.drawStr(0, 20, buf);
+  snprintf(buf, sizeof(buf), "low  %4.1fk", ESP.getMinFreeHeap() / 1024.0);
+  u8g2.drawStr(0, 30, buf);
+  snprintf(buf, sizeof(buf), "cpu  %dMHz", (int)getCpuFrequencyMhz());
+  u8g2.drawStr(0, 40, buf);
+}
+
 // MODE_WEATHER: current temperature (big) + condition text. "no data" until the
 // first successful fetch.
 static void drawWeather() {
@@ -498,16 +733,109 @@ static void drawBright() {
   drawCentered(39, "hold=change");
 }
 
-// MODE_FLASH: a flashlight. When on, fill the panel; otherwise show the hint.
+// MODE_FLASH: the flashlight's control screen. The lit panel itself is a global
+// override drawn in loop(); here we just show how to turn it on.
 static void drawFlash() {
-  if (torchOn) {
-    u8g2.drawBox(0, 0, 72, 40);  // whole screen lit
-    return;
-  }
   u8g2.setFont(u8g2_font_5x8_tr);
   drawCentered(8, "FLASHLIGHT");
   drawCentered(22, "hold 1s");
   drawCentered(34, "to turn on");
+}
+
+// MODE_EMERGENCY: the strobe's control screen (the flashing is a global override
+// in loop()). Shows the current rate; long-press starts it.
+static void drawEmergency() {
+  char buf[12];
+  u8g2.setFont(u8g2_font_5x8_tr);
+  drawCentered(8, "EMERGENCY");
+  snprintf(buf, sizeof(buf), "%d Hz", flashHz);
+  drawCentered(22, buf);
+  drawCentered(34, "hold=flash");
+}
+
+// One key pose of the run cycle. All limb points are (dx, dy) offsets: legs are
+// measured from the hip, arms from the shoulder. `bob` drops the whole figure a
+// pixel on the mid-stride frames to give it a little vertical bounce.
+struct RunFrame {
+  int8_t kneeL[2], footL[2];
+  int8_t kneeR[2], footR[2];
+  int8_t elbowL[2], handL[2];
+  int8_t elbowR[2], handR[2];
+  int8_t bob;
+};
+
+// MODE_RUNNER: a stick figure jogging in place over a scrolling ground. The
+// pose and the ground offset are both derived from millis(), so it animates on
+// its own; loop() redraws this screen faster than the others to keep it smooth.
+static void drawRunner() {
+  const int groundY = 37;
+  // Dashes that march left to fake forward motion.
+  int shift = (millis() / 40) % 8;
+  for (int x = -shift; x < 72; x += 8) u8g2.drawHLine(x, groundY, 4);
+
+  // Four hand-tuned poses: stride-left, gather, stride-right, gather. Arms
+  // swing opposite the legs.
+  static const RunFrame frames[4] = {
+    // kneeL    footL     kneeR     footR     elbowL    handL     elbowR    handR   bob
+    {{ 4, 6}, { 8,11}, {-3, 6}, {-7,10}, {-4, 4}, {-7, 6}, { 4, 4}, { 7, 7}, 0},
+    {{ 2, 5}, { 3,11}, {-1, 7}, { 0,12}, {-2, 4}, {-3, 7}, { 2, 4}, { 3, 7}, 1},
+    {{-3, 6}, {-7,10}, { 4, 6}, { 8,11}, { 4, 4}, { 7, 7}, {-4, 4}, {-7, 6}, 0},
+    {{-1, 7}, { 0,12}, { 2, 5}, { 3,11}, { 2, 4}, { 3, 7}, {-2, 4}, {-3, 7}, 1},
+  };
+  // Jump endpoints. As the figure rises it morphs from a feet-down stance into a
+  // legs-tucked, arms-overhead apex pose; on the way down it morphs back. Both
+  // are blended by height so the legs reach the ground exactly as lift hits 0 --
+  // no snap when control returns to the run cycle.
+  static const RunFrame standPose =
+    {{-1, 6}, {-2,12}, { 1, 6}, { 2,12}, {-2, 4}, {-3, 7}, { 2, 4}, { 3, 7}, 0};
+  static const RunFrame apexPose =
+    {{ 4, 5}, { 6, 3}, {-4, 5}, {-6, 3}, {-3, 2}, {-6,-1}, { 3, 2}, { 6,-1}, 0};
+
+  // A jump is a single parabolic hop: lift peaks halfway through JUMP_MS, then
+  // the figure settles back onto the ground and resumes running.
+  const unsigned long JUMP_MS = 700;
+  const int JUMP_H = 16;          // peak lift in pixels
+  int lift = 0;
+  RunFrame jumpFrame;             // stand<->apex blend, only used while jumping
+  if (jumpStart) {
+    unsigned long dt = millis() - jumpStart;
+    if (dt < JUMP_MS) {
+      float p = dt / (float)JUMP_MS;        // 0..1 through the hop
+      lift = (int)(JUMP_H * 4 * p * (1 - p) + 0.5f);  // parabola, 0 at the ends
+      // Blend every limb point from stance to apex by how high we are.
+      float t = lift / (float)JUMP_H;
+      const int8_t *a = (const int8_t *)&standPose;
+      const int8_t *b = (const int8_t *)&apexPose;
+      int8_t *c = (int8_t *)&jumpFrame;
+      for (size_t i = 0; i < sizeof(RunFrame); i++)
+        c[i] = (int8_t)lroundf(a[i] + t * (b[i] - a[i]));
+    } else {
+      jumpStart = 0;                        // landed
+    }
+  }
+
+  const RunFrame &f = jumpStart ? jumpFrame : frames[(millis() / 120) % 4];
+
+  const int cx = 36;                      // hip x
+  const int hipY = 24 + f.bob - lift;     // hip y (feet reach the ground from here)
+  const int shX = cx + 1;         // shoulder, leaning slightly forward
+  const int shY = hipY - 9;
+
+  // Torso + filled head.
+  u8g2.drawLine(cx, hipY, shX, shY);
+  u8g2.drawDisc(shX + 1, shY - 3, 3, U8G2_DRAW_ALL);
+
+  // Legs: hip -> knee -> foot.
+  u8g2.drawLine(cx, hipY, cx + f.kneeL[0], hipY + f.kneeL[1]);
+  u8g2.drawLine(cx + f.kneeL[0], hipY + f.kneeL[1], cx + f.footL[0], hipY + f.footL[1]);
+  u8g2.drawLine(cx, hipY, cx + f.kneeR[0], hipY + f.kneeR[1]);
+  u8g2.drawLine(cx + f.kneeR[0], hipY + f.kneeR[1], cx + f.footR[0], hipY + f.footR[1]);
+
+  // Arms: shoulder -> elbow -> hand.
+  u8g2.drawLine(shX, shY, shX + f.elbowL[0], shY + f.elbowL[1]);
+  u8g2.drawLine(shX + f.elbowL[0], shY + f.elbowL[1], shX + f.handL[0], shY + f.handL[1]);
+  u8g2.drawLine(shX, shY, shX + f.elbowR[0], shY + f.elbowR[1]);
+  u8g2.drawLine(shX + f.elbowR[0], shY + f.elbowR[1], shX + f.handR[0], shY + f.handR[1]);
 }
 
 void setup() {
@@ -519,6 +847,7 @@ void setup() {
   u8g2.begin();
   u8g2.setBusClock(100000);  // 100kHz I2C: more tolerant of supply noise
   loadBrightness();
+  loadFlashFreq();
   applyBrightness();         // honor the saved brightness from the first frame
 
   loadCreds();
@@ -535,6 +864,7 @@ void setup() {
     // packet self-heals instead of freezing on "Syncing time...".
     showMessage("Syncing", "time...");
     configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov");
+    startDashboard();  // bring up the live web dashboard on the home network
     appState = ST_RUN;
   } else {
     // Saved creds didn't work (wrong password, network gone, 5GHz, ...).
@@ -552,6 +882,10 @@ void loop() {
     delay(5);
     return;
   }
+
+  // Service the dashboard every loop so it stays responsive even while the
+  // clock is still syncing time below.
+  server.handleClient();
 
   struct tm t;
 
@@ -611,22 +945,35 @@ void loop() {
     return;
   }
 
-  // Redraw at ~4Hz (smooth colon blink / ticking seconds) but keep the loop
-  // itself fast so the button stays responsive.
+  // Redraw at ~4Hz (smooth colon blink / ticking seconds) -- except the runner
+  // (animates) and the strobe (needs fast on/off edges). The loop itself stays
+  // fast so the button remains responsive.
   static unsigned long lastDraw = 0;
-  if (now - lastDraw >= 250) {
+  unsigned long drawEvery = strobeOn ? 15 : (mode == MODE_RUNNER ? 60 : 250);
+  if (now - lastDraw >= drawEvery) {
     lastDraw = now;
     u8g2.clearBuffer();
-    switch (mode) {
-      case MODE_CLOCK:   drawClock(t);   break;
-      case MODE_DATE:    drawBigDate(t); break;
-      case MODE_SECONDS: drawSeconds(t); break;
-      case MODE_UPTIME:  drawUptime();   break;
-      case MODE_WEATHER: drawWeather();  break;
-      case MODE_WIFI:    drawWifi();     break;
-      case MODE_BRIGHT:  drawBright();   break;
-      case MODE_FLASH:   drawFlash();    break;
-      default:           drawClock(t);   break;
+    if (torchOn) {
+      u8g2.drawBox(0, 0, 72, 40);              // steady flashlight
+    } else if (strobeOn) {
+      unsigned long half = 500UL / flashHz;    // one on/off phase, ms
+      if (half < 1) half = 1;
+      if ((now / half) % 2 == 0) u8g2.drawBox(0, 0, 72, 40);  // flashing
+    } else {
+      switch (mode) {
+        case MODE_CLOCK:     drawClock(t);   break;
+        case MODE_DATE:      drawBigDate(t); break;
+        case MODE_SECONDS:   drawSeconds(t); break;
+        case MODE_UPTIME:    drawUptime();   break;
+        case MODE_STATS:     drawStats();    break;
+        case MODE_WEATHER:   drawWeather();  break;
+        case MODE_WIFI:      drawWifi();     break;
+        case MODE_BRIGHT:    drawBright();   break;
+        case MODE_FLASH:     drawFlash();    break;
+        case MODE_EMERGENCY: drawEmergency(); break;
+        case MODE_RUNNER:    drawRunner();   break;
+        default:             drawClock(t);   break;
+      }
     }
     u8g2.sendBuffer();
   }
