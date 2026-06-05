@@ -61,10 +61,26 @@ Short-press the BOOT button to cycle through:
 | **Big Date** | Weekday · big `DD/MM` · year |
 | **Seconds** | Large ticking seconds counter |
 | **Uptime** | Time since boot (`HH:MM:SS`, or `Nd HH:MM` past a day) |
+| **Stats** | Live free / minimum heap (RAM) and CPU clock — the board's "top" |
 | **Weather** | Current temperature + conditions (Open-Meteo, refreshes every 15 min) |
 | **WiFi** | Connection status, SSID, IP, and signal (long-press here = setup) |
 | **Brightness** | Current level; long-press cycles Low / Med / High (saved across reboots) |
 | **Flashlight** | Long-press (~1s) lights the whole screen at full power; any press turns it off |
+| **Emergency** | Long-press starts a full-screen strobe; rate is set on the web dashboard |
+| **Runner** | Animated stick-figure jogger; long-press makes it jump |
+
+## Web dashboard
+
+Once connected to your network the clock also serves a live control page — open
+**`http://wifi-clock.local/`** (mDNS) from any device on the same WiFi (or use the IP shown
+on the WiFi screen). It polls the device once a second and lets you:
+
+- See the time/date, weather, network + signal, uptime, and free heap.
+- Switch the display screen, set brightness (Low/Med/High), toggle the flashlight.
+- Turn the emergency strobe on/off and set its frequency (1–10 Hz) with a slider.
+
+It's a single self-contained page (no internet needed) and shares the same web server as the
+first-time setup portal. See [NOTES.md](NOTES.md) for how the two coexist.
 
 ## Design notes
 
@@ -82,5 +98,8 @@ Short-press the BOOT button to cycle through:
 ## Roadmap
 
 - ~~WiFi config portal~~ — done (browser-based setup, see above)
-- Auto-dimming / night brightness
 - ~~Weather display~~ — done (Open-Meteo, no API key; set your coords via `WEATHER_LAT`/`WEATHER_LON`)
+- ~~Web dashboard / remote control~~ — done (`http://wifi-clock.local/`)
+- ~~Stats, running-man, emergency strobe~~ — done
+- Auto-dimming / night brightness — still open
+- Ideas: async weather fetch, BLE indoor-temp sensor, dashboard reboot button (see NOTES.md)
